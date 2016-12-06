@@ -63,10 +63,12 @@ static struct nano_fifo dns_qname_fifo;
 static NET_BUF_POOL(dns_qname_pool, DNS_RESOLVER_BUF_CTR,
 		    DNS_MAX_NAME_LEN, &dns_qname_fifo, NULL, 0);
 
-int dns_init(void)
+int dns_init(struct dns_context *ctx)
 {
 	net_buf_pool_init(dns_msg_pool);
 	net_buf_pool_init(dns_qname_pool);
+
+	k_sem_init(&ctx->rx_sem, 0, UINT_MAX);
 
 	return 0;
 }
@@ -78,6 +80,11 @@ int dns_write(struct dns_context *ctx, struct net_buf *dns_data,
 static
 int dns_read(struct dns_context *ctx, struct net_buf *dns_data,
 	     uint16_t dns_id, uint8_t *cname, uint16_t *cname_len);
+
+/* net_context_recv callback */
+static
+void cb_recv(struct net_context *net_ctx, struct net_buf *buf, int status,
+	     void *data);
 
 /*
  * Note about the DNS transaction identifier:
@@ -94,7 +101,11 @@ int dns_resolve(struct dns_context *ctx)
 	int rc;
 	int i;
 
+	k_sem_reset(&ctx->rx_sem);
+
 	dns_id = sys_rand32_get();
+
+	net_context_recv(ctx->net_ctx, cb_recv, K_NO_WAIT, ctx);
 
 	dns_data = net_buf_get_timeout(&dns_msg_fifo, 0, ctx->timeout);
 	if (dns_data == NULL) {
@@ -144,6 +155,9 @@ exit_resolve:
 	/* dns_data may be NULL, however net_nbuf_unref supports that */
 	net_nbuf_unref(dns_data);
 	net_nbuf_unref(dns_qname);
+
+	/* uninstall the callback */
+	net_context_recv(ctx->net_ctx, NULL, 0, NULL);
 
 	return rc;
 }
@@ -197,32 +211,19 @@ exit_write:
 }
 
 static
-void cb_recv(struct net_context *context, struct net_buf *buf, int status,
-		void *user_data)
+void cb_recv(struct net_context *net_ctx, struct net_buf *buf, int status,
+	     void *data)
 {
-	struct net_buf **data;
+	struct dns_context *ctx = (struct dns_context *)data;
 
-	ARG_UNUSED(context);
+	ARG_UNUSED(net_ctx);
 
 	if (status != 0) {
 		return;
 	}
 
-	data = (struct net_buf **)user_data;
-	*data = buf;
-}
-
-static
-int dns_recv(struct net_context *net_ctx, struct net_buf **buf, int32_t timeout)
-{
-	int rc;
-
-	rc = net_context_recv(net_ctx, cb_recv, timeout, buf);
-	if (rc != 0) {
-		return -EIO;
-	}
-
-	return 0;
+	ctx->rx_buf = buf;
+	k_sem_give(&ctx->rx_sem);
 }
 
 static
@@ -233,7 +234,6 @@ static
 int dns_read(struct dns_context *ctx, struct net_buf *dns_data,
 	     uint16_t dns_id, uint8_t *cname, uint16_t *cname_len)
 {
-	struct net_buf *rx = NULL;
 	/* helper struct to track the dns msg received from the server */
 	struct dns_msg_t dns_msg;
 	uint8_t *addresses;
@@ -259,19 +259,29 @@ int dns_read(struct dns_context *ctx, struct net_buf *dns_data,
 		goto exit_error;
 	}
 
-	rc = dns_recv(ctx->net_ctx, &rx, ctx->timeout);
-	if (rc != 0) {
+	ctx->rx_buf = NULL;
+
+	/* Block until timeout or data is received, see the 'cb_recv' routine */
+	k_sem_take(&ctx->rx_sem, ctx->timeout);
+
+	/* If data is received, rx_buf is set inside 'cb_recv'. Otherwise,
+	 * k_sem_take will expire while ctx->rx_buf is still NULL
+	 */
+	if (!ctx->rx_buf) {
 		rc = -EIO;
 		goto exit_error;
 	}
 
-	data_len = min(net_nbuf_appdatalen(rx), DNS_RESOLVER_MAX_BUF_SIZE);
-	offset = net_buf_frags_len(rx) - data_len;
+	data_len = min(net_nbuf_appdatalen(ctx->rx_buf),
+		       DNS_RESOLVER_MAX_BUF_SIZE);
+	offset = net_buf_frags_len(ctx->rx_buf) - data_len;
 
-	if (nbuf_copy(dns_data, rx, offset, data_len) != 0) {
+	if (nbuf_copy(dns_data, ctx->rx_buf, offset, data_len) != 0) {
 		rc = -ENOMEM;
 		goto exit_error;
 	}
+
+	k_sem_give(&ctx->rx_sem);
 
 	dns_msg.msg = dns_data->data;
 	dns_msg.msg_size = data_len;
@@ -367,7 +377,7 @@ exit_ok:
 	rc = 0;
 
 exit_error:
-	net_nbuf_unref(rx);
+	net_nbuf_unref(ctx->rx_buf);
 	return rc;
 }
 
